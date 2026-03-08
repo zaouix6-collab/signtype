@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+env/
+.env
+
+# MediaPipe / ML Models
+data/landmarks/
+data/asl_alphabet_raw/
+data/*.pkl
+data/*.pt
+data/custom_gestures/**/*.npy
+
+# Config / Logs
+config.json (Copy to config.json.example for repo)
+*.log
+
+# IDEs
+.vscode/
+.idea/
+.project
+.pydevproject
+
+# OS
+.DS_Store
+Thumbs.db

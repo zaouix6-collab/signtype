@@ -1,0 +1,28 @@
+# Core ML
+mediapipe
+scikit-learn>=1.5,<2.0
+numpy>=2.0
+
+# PyTorch CPU-only — install FIRST with:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+# Then install remaining deps from this file.
+
+# Camera
+opencv-python>=4.10
+
+# Web server
+fastapi>=0.115
+uvicorn>=0.34
+
+# System tray
+pystray>=0.19
+Pillow>=11.0
+
+# Config watching
+watchdog>=6.0
+
+# GTK4 overlay — uses system PyGObject via --system-site-packages venv
+# No pip install needed for PyGObject if venv uses system packages
+
+# NOTE: After successful install, run `pip freeze > requirements.lock`
+# to pin exact versions for reproducibility.

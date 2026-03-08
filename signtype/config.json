@@ -1,0 +1,12 @@
+{
+  "custom_gestures": {},
+  "settings": {
+    "confidence_threshold": 0.85,
+    "hold_duration_ms": 500,
+    "cooldown_ms": 1500,
+    "fingerspell_hold_ms": 300,
+    "camera_index": 0,
+    "inactivity_timeout_seconds": 60,
+    "settings_port": 7842
+  }
+}
