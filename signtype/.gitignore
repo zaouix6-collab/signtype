@@ -6,18 +6,20 @@ __pycache__/
 venv/
 ENV/
 env/
+
+# Environment
 .env
 
-# MediaPipe / ML Models
+# MediaPipe / ML Models & Data
 data/landmarks/
 data/asl_alphabet_raw/
+data/asl_alphabet_test/
+data/custom_gestures/
 data/*.pkl
 data/*.pt
-data/custom_gestures/**/*.npy
 
-# Config / Logs
-config.json (Copy to config.json.example for repo)
-*.log
+# Config (use config.json.example for repo)
+config.json
 
 # IDEs
 .vscode/

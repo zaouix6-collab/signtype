@@ -41,6 +41,13 @@ def preprocess_dataset(
         print(f"  Extract it to: {raw_dir}")
         return False
 
+    # Auto-detect Kaggle's nested structure:
+    # asl_alphabet_raw/asl_alphabet_train/asl_alphabet_train/A/
+    nested = os.path.join(raw_dir, "asl_alphabet_train", "asl_alphabet_train")
+    if os.path.isdir(nested):
+        print(f"Auto-detected Kaggle nested structure, using: {nested}")
+        raw_dir = nested
+
     os.makedirs(output_dir, exist_ok=True)
 
     extractor = LandmarkExtractor(static_image_mode=True, max_num_hands=1)
