@@ -1,13 +1,15 @@
-"""SignType - Main entry point.
+"""SignType — Main entry point.
 
 Orchestrates 7 threads:
-1. Camera capture
-2. Inference (Fingerspell + Dynamic + Static)
-3. State machine
-4. Overlay (GTK4)
-5. Settings server (FastAPI)
-6. Visual notification processor
-7. System tray
+1. Camera capture (threaded frame grabber)
+2. Inference loop (landmarks → classifiers → actions)
+3. State machine (mode transitions, inactivity timeout)
+4. Overlay (GTK4 + gtk4-layer-shell floating buffer)
+5. Settings server (FastAPI on localhost:7842)
+6. Visual notification processor (toast messages)
+7. System tray (pystray with mode-colored icon)
+
+All feedback is visual. No audio output — designed for deaf/HoH users.
 """
 
 import os
@@ -16,14 +18,15 @@ import queue
 import threading
 import time
 import json
-import webbrowser
+import signal
+import collections
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from core.camera import Camera
 from core.landmark_extractor import LandmarkExtractor
-from core.state_machine import StateMachine, State
+from core.state_machine import StateMachine, State, GestureEvent
 from core.fingerspell_classifier import FingerspellClassifier
 from core.gesture_classifier import GestureClassifier
 from core.dynamic_classifier import DynamicGestureLSTM
@@ -36,52 +39,76 @@ from settings.server import run_settings_server
 
 
 class SignTypeApp:
-    """The main SignType application class."""
+    """Main SignType application — wires all components together."""
 
-    def __init__(self, config_path: str = "config.json"):
-        self.config_path = config_path
+    def __init__(self, config_path: str = ""):
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        self.config_path = config_path or os.path.join(base_dir, "config.json")
         self.config = self._load_config()
+        self.data_dir = os.path.join(base_dir, "data")
 
-        # Shared resource queues
+        # Shared event queue for the state machine
         self.event_queue = queue.Queue()
-        self.landmark_queue = queue.Queue(maxsize=1)
 
-        # Initialize core components
-        camera_idx = self.config.get("settings", {}).get("camera_index", 0)
-        self.camera = Camera(camera_index=camera_idx)
+        # --- Core components ---
+        settings = self.config.get("settings", {})
+        self.camera = Camera(camera_index=settings.get("camera_index", 0))
         self.extractor = LandmarkExtractor()
-        self.state_machine = StateMachine(self.event_queue)
+        self.state_machine = StateMachine(
+            self.event_queue,
+            inactivity_timeout=settings.get("inactivity_timeout_seconds", 60),
+        )
 
-        # Models
-        data_dir = os.path.join(os.path.dirname(__file__), "data")
+        # --- Classifiers ---
         self.fingerspell = FingerspellClassifier(
-            os.path.join(data_dir, "model_fingerspell.pkl")
+            os.path.join(self.data_dir, "model_fingerspell.pkl")
         )
         self.gesture_clf = GestureClassifier(
-            os.path.join(data_dir, "model_static.pkl")
+            os.path.join(self.data_dir, "model_static.pkl")
         )
-        # Dynamic LSTM is specialized
-        dyn_path = os.path.join(data_dir, "model_dynamic.pt")
+        dyn_path = os.path.join(self.data_dir, "model_dynamic.pt")
         self.dynamic_clf = None
         if os.path.exists(dyn_path):
             self.dynamic_clf = DynamicGestureLSTM.from_file(dyn_path)
 
-        # Feedback & IO
+        # --- Feedback (all visual) ---
         self.visual_feedback = VisualFeedback()
         self.overlay = BufferOverlay()
         self.tray = TrayIcon()
 
-        # Handlers
+        # --- Action handlers ---
         self.text_injector = TextInjector()
         self.command_dispatcher = CommandDispatcher()
 
-        # State transitions / notifications
+        # --- Wiring ---
+        # State machine → overlay + tray + visual notification
         self.state_machine.on_state_change = self._on_state_change
+
+        # Visual feedback → overlay toasts
         self.visual_feedback.on_notification = lambda n: self.overlay.show_notification(
             n.message, n.level, n.duration_ms
         )
 
+        # Tray callbacks
+        self.tray.on_quit = self.stop
+        self.tray.on_toggle = self._toggle_system
+        self.tray.on_open_settings = lambda: self.visual_feedback.notify(
+            f"Settings: http://127.0.0.1:{settings.get('settings_port', 7842)}",
+            level="info", duration_ms=5000,
+        )
+
+        # --- Confidence settings ---
+        self._conf_threshold = settings.get("confidence_threshold", 0.70)
+        self._cmd_conf_threshold = settings.get("command_confidence_threshold", 0.85)
+        self._hold_ms = settings.get("fingerspell_hold_ms", 300)
+
+        # --- Typing state (hold-to-confirm lives in TextInjector) ---
+
+        # --- Dynamic gesture buffer (rolling 30 frames) ---
+        self._landmark_buffer = collections.deque(maxlen=30)
+
         self._running = False
+        self._paused = False
 
     def _load_config(self) -> dict:
         if os.path.exists(self.config_path):
@@ -89,8 +116,23 @@ class SignTypeApp:
                 return json.load(f)
         return {"settings": {}, "gestures": {}}
 
+    def _reload_config(self):
+        """Hot-reload config.json."""
+        try:
+            old_config = self.config
+            self.config = self._load_config()
+            settings = self.config.get("settings", {})
+            self._conf_threshold = settings.get("confidence_threshold", 0.70)
+            self._cmd_conf_threshold = settings.get("command_confidence_threshold", 0.85)
+            self._hold_ms = settings.get("fingerspell_hold_ms", 300)
+            self.visual_feedback.notify("Config reloaded", level="success", duration_ms=2000)
+        except Exception as e:
+            self.visual_feedback.notify(f"Config reload failed: {e}", level="error")
+
+    # --- State machine callbacks ---
+
     def _on_state_change(self, old_state, new_state):
-        """Handle state-specific visual feedback."""
+        """Propagate state changes to all visual components."""
         self.overlay.update_mode(new_state.name)
         self.tray.update_mode(new_state.name)
         self.visual_feedback.announce_mode_switch(new_state.name)
@@ -100,80 +142,141 @@ class SignTypeApp:
         else:
             self.overlay.show()
 
+        # Clear typing buffer on mode switch
+        if old_state == State.TYPING and new_state != State.TYPING:
+            self.text_injector.clear()
+            self.overlay.update_buffer("")
+
+    def _toggle_system(self):
+        """Pause/resume from tray."""
+        self._paused = not self._paused
+        status = "paused" if self._paused else "resumed"
+        self.visual_feedback.notify(f"System {status}", level="info", duration_ms=2000)
+
+    # --- Main inference loop ---
+
     def _run_inference_loop(self):
-        """The main bridge: landmark extraction -> classification -> execution."""
+        """Landmark extraction → classification → action execution."""
         while self._running:
+            if self._paused:
+                time.sleep(0.1)
+                continue
+
             frame = self.camera.read(timeout=0.5)
             if frame is None:
                 continue
 
-            # Extract 21 landmarks
             landmarks = self.extractor.extract_single(frame)
-
-            # Route to appropriate classifier based on mode
-            current_state = self.state_machine.current_state
+            current_state = self.state_machine.state
 
             if landmarks is not None:
+                # Add to dynamic gesture buffer
+                self._landmark_buffer.append(landmarks)
+
                 if current_state == State.TYPING:
-                    # Finger spelling mode
-                    letter, confidence = self.fingerspell.predict(landmarks)
-                    if confidence > self.config.get("settings", {}).get("confidence_threshold", 0.7):
-                        result = self.text_injector.append(letter)
-                        if result:
-                            # Visual feedback of typed char
-                            pass
+                    self._handle_typing(landmarks)
 
                 elif current_state == State.COMMAND:
-                    # Static command mode
-                    gesture, confidence = self.gesture_clf.predict(landmarks)
-                    if confidence > self.config.get("settings", {}).get("command_confidence_threshold", 0.85):
-                        # Dispatch command
-                        binding = self.config.get("gestures", {}).get(gesture)
-                        if binding:
-                            self.command_dispatcher.dispatch(
-                                binding["type"], binding["value"], gesture
-                            )
-                            self.visual_feedback.announce_command_fired(gesture, binding["value"])
+                    self._handle_command(landmarks)
 
-                # Dynamic gestures (like mode switch: double palm)
-                # This would feed into a small buffer for the LSTM
-                # For brevity in this main file, we use the state machine's internal check
-                # or a simplified version:
-                pass
+                # Check for dynamic gestures (mode switch, etc.) in any state
+                if self.dynamic_clf and len(self._landmark_buffer) == 30:
+                    self._handle_dynamic_gesture()
 
-            # Inform state machine of hand activity for inactivity clock
-            self.state_machine.log_activity(landmarks is not None)
+            # Reset inactivity timer on hand detection
+            if landmarks is not None:
+                self.state_machine._last_activity = time.time()
 
-            # Yield thread
-            time.sleep(0.01)
+            # ~30 FPS target
+            time.sleep(0.016)
+
+    def _handle_typing(self, landmarks):
+        """Process a landmark frame in typing mode with hold-to-confirm.
+        
+        Uses TextInjector.process_classification which already implements
+        the 300ms consistent classification gating.
+        """
+        letter, confidence = self.fingerspell.predict(landmarks)
+        self.text_injector.process_classification(letter, confidence, self._conf_threshold)
+        self.overlay.update_buffer(self.text_injector.buffer_text)
+
+    def _handle_command(self, landmarks):
+        """Process a landmark frame in command mode."""
+        gesture, confidence = self.gesture_clf.predict(landmarks)
+
+        if confidence < self._cmd_conf_threshold:
+            return
+
+        binding = self.config.get("gestures", {}).get(gesture)
+        if binding:
+            fired = self.command_dispatcher.dispatch(
+                binding["type"], binding["value"], gesture
+            )
+            if fired:
+                self.visual_feedback.announce_command_fired(gesture, binding["value"])
+
+    def _handle_dynamic_gesture(self):
+        """Check the 30-frame buffer for dynamic gestures like mode switch."""
+        import numpy as np
+        sequence = np.array(list(self._landmark_buffer))
+        gesture, confidence = self.dynamic_clf.predict(sequence)
+
+        if confidence > self._cmd_conf_threshold and gesture:
+            if gesture == "mode_switch":
+                self.event_queue.put(GestureEvent(
+                    "dynamic", "mode_switch", confidence, time.time()
+                ))
+                self._landmark_buffer.clear()
+            elif gesture == "enter_idle":
+                self.event_queue.put(GestureEvent(
+                    "dynamic", "enter_idle", confidence, time.time()
+                ))
+                self._landmark_buffer.clear()
+
+    # --- Lifecycle ---
 
     def start(self):
-        """Launch all components."""
+        """Launch all 7 threads and enter main loop."""
         self._running = True
 
-        # Check for first run (missing models)
-        data_dir = os.path.join(os.path.dirname(__file__), "data")
-        main_model = os.path.join(data_dir, "model_fingerspell.pkl")
-        if not os.path.exists(main_model):
+        # First run check
+        if not self._check_models():
             self._first_run_experience()
 
-        # Start background components
+        # Start all subsystems
         self.visual_feedback.start()
+        self.visual_feedback.announce_startup()
+
         self.camera.start()
         self.overlay.start()
         self.tray.start()
         self.state_machine.start()
 
-        # Start settings server
+        # Settings server
         port = self.config.get("settings", {}).get("settings_port", 7842)
         run_settings_server(self.config_path, port)
 
-        # Main inference thread
-        self.inference_thread = threading.Thread(target=self._run_inference_loop, daemon=True)
-        self.inference_thread.start()
+        # Inference thread
+        inference_thread = threading.Thread(
+            target=self._run_inference_loop, daemon=True, name="inference"
+        )
+        inference_thread.start()
 
-        self.visual_feedback.announce_startup()
+        # Config file watcher (poll every 5 seconds)
+        config_thread = threading.Thread(
+            target=self._watch_config, daemon=True, name="config-watcher"
+        )
+        config_thread.start()
+
         self.visual_feedback.announce_ready()
+
+        print("[SignType] All systems running.")
+        print(f"[SignType] Settings: http://127.0.0.1:{port}")
+        print("[SignType] Press Ctrl+C to stop.")
+
+        # Graceful shutdown on SIGINT/SIGTERM
+        signal.signal(signal.SIGINT, lambda s, f: self.stop())
+        signal.signal(signal.SIGTERM, lambda s, f: self.stop())
 
         # Keep main thread alive
         try:
@@ -182,24 +285,61 @@ class SignTypeApp:
         except KeyboardInterrupt:
             self.stop()
 
+    def _check_models(self) -> bool:
+        """Check if required models exist."""
+        main_model = os.path.join(self.data_dir, "model_fingerspell.pkl")
+        return os.path.exists(main_model)
+
     def _first_run_experience(self):
-        """Guide user through initial setup when models are missing."""
-        print("!!! First run detected: Finger spelling model missing !!!")
-        print("1. Download ASL dataset")
-        print("2. Run training/preprocess_dataset.py")
-        print("3. Run training/train_fingerspell.py")
-        print("Opening settings server at http://localhost:7842")
+        """Visual-only first run guidance."""
+        print()
+        print("╔══════════════════════════════════════════════╗")
+        print("║     SignType — First Run Setup Needed        ║")
+        print("╠══════════════════════════════════════════════╣")
+        print("║                                              ║")
+        print("║  The finger spelling model is missing.       ║")
+        print("║  To set up:                                  ║")
+        print("║                                              ║")
+        print("║  1. python training/preprocess_dataset.py    ║")
+        print("║  2. python training/train_fingerspell.py     ║")
+        print("║                                              ║")
+        print("║  Or use: make train                          ║")
+        print("║                                              ║")
+        print("║  The system will start in limited mode.      ║")
+        print("║  Settings server will be available at:       ║")
+        print("║  http://127.0.0.1:7842                       ║")
+        print("║                                              ║")
+        print("╚══════════════════════════════════════════════╝")
+        print()
 
         self.visual_feedback.announce_first_run()
 
+    def _watch_config(self):
+        """Poll config.json for changes every 5 seconds."""
+        last_mtime = 0.0
+        while self._running:
+            try:
+                mtime = os.path.getmtime(self.config_path)
+                if mtime > last_mtime and last_mtime > 0:
+                    self._reload_config()
+                last_mtime = mtime
+            except OSError:
+                pass
+            time.sleep(5)
+
     def stop(self):
-        """Graceful shutdown."""
+        """Graceful shutdown of all subsystems."""
+        if not self._running:
+            return
         self._running = False
+
+        print("[SignType] Shutting down...")
         self.camera.stop()
         self.state_machine.stop()
         self.overlay.quit()
         self.tray.stop()
         self.visual_feedback.stop()
+        self.extractor.close()
         print("[SignType] Shutdown complete.")
 
 
