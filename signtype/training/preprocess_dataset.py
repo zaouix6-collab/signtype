@@ -69,6 +69,15 @@ def preprocess_dataset(
     total_failed = 0
 
     for class_name in classes:
+        # Resume support: skip classes that already have a .npy file
+        output_path = os.path.join(output_dir, f"{class_name}.npy")
+        if os.path.exists(output_path):
+            existing = np.load(output_path)
+            count = len(existing)
+            print(f"  ✓ {class_name}: {count} landmarks already saved — skipping")
+            total_extracted += count
+            continue
+
         class_dir = os.path.join(raw_dir, class_name)
         images = [
             f for f in os.listdir(class_dir)
