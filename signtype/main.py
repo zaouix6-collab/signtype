@@ -19,7 +19,6 @@ import threading
 import time
 import json
 import signal
-import collections
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -29,7 +28,7 @@ from core.landmark_extractor import LandmarkExtractor
 from core.state_machine import StateMachine, State, GestureEvent
 from core.fingerspell_classifier import FingerspellClassifier
 from core.gesture_classifier import GestureClassifier
-from core.dynamic_classifier import DynamicGestureLSTM
+from core.dynamic_classifier import DynamicClassifier
 from core.text_injector import TextInjector
 from core.command_dispatcher import CommandDispatcher
 from feedback.buffer_overlay import BufferOverlay
@@ -67,9 +66,7 @@ class SignTypeApp:
             os.path.join(self.data_dir, "model_static.pkl")
         )
         dyn_path = os.path.join(self.data_dir, "model_dynamic.pt")
-        self.dynamic_clf = None
-        if os.path.exists(dyn_path):
-            self.dynamic_clf = DynamicGestureLSTM.from_file(dyn_path)
+        self.dynamic_clf = DynamicClassifier(model_path=dyn_path)
 
         # --- Feedback (all visual) ---
         self.visual_feedback = VisualFeedback()
@@ -103,9 +100,6 @@ class SignTypeApp:
         self._hold_ms = settings.get("fingerspell_hold_ms", 300)
 
         # --- Typing state (hold-to-confirm lives in TextInjector) ---
-
-        # --- Dynamic gesture buffer (rolling 30 frames) ---
-        self._landmark_buffer = collections.deque(maxlen=30)
 
         self._running = False
         self._paused = False
@@ -170,8 +164,8 @@ class SignTypeApp:
             current_state = self.state_machine.state
 
             if landmarks is not None:
-                # Add to dynamic gesture buffer
-                self._landmark_buffer.append(landmarks)
+                # Feed frame to dynamic gesture classifier's internal buffer
+                self.dynamic_clf.add_frame(landmarks)
 
                 if current_state == State.TYPING:
                     self._handle_typing(landmarks)
@@ -180,7 +174,7 @@ class SignTypeApp:
                     self._handle_command(landmarks)
 
                 # Check for dynamic gestures (mode switch, etc.) in any state
-                if self.dynamic_clf and len(self._landmark_buffer) == 30:
+                if self.dynamic_clf.is_loaded and self.dynamic_clf.buffer_length >= 30:
                     self._handle_dynamic_gesture()
 
             # Reset inactivity timer on hand detection
@@ -216,22 +210,20 @@ class SignTypeApp:
                 self.visual_feedback.announce_command_fired(gesture, binding["value"])
 
     def _handle_dynamic_gesture(self):
-        """Check the 30-frame buffer for dynamic gestures like mode switch."""
-        import numpy as np
-        sequence = np.array(list(self._landmark_buffer))
-        gesture, confidence = self.dynamic_clf.predict(sequence)
+        """Check the internal buffer for dynamic gestures like mode switch."""
+        gesture, confidence = self.dynamic_clf.predict()
 
-        if confidence > self._cmd_conf_threshold and gesture:
+        if confidence > self._cmd_conf_threshold and gesture not in ("none", ""):
             if gesture == "mode_switch":
                 self.event_queue.put(GestureEvent(
                     "dynamic", "mode_switch", confidence, time.time()
                 ))
-                self._landmark_buffer.clear()
+                self.dynamic_clf.clear_buffer()
             elif gesture == "enter_idle":
                 self.event_queue.put(GestureEvent(
                     "dynamic", "enter_idle", confidence, time.time()
                 ))
-                self._landmark_buffer.clear()
+                self.dynamic_clf.clear_buffer()
 
     # --- Lifecycle ---
 
