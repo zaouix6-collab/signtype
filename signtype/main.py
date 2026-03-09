@@ -75,7 +75,7 @@ class SignTypeApp:
 
         # --- Action handlers ---
         self.text_injector = TextInjector()
-        self.command_dispatcher = CommandDispatcher()
+        self.command_dispatcher = CommandDispatcher(self.config_path)
 
         # --- Wiring ---
         # State machine → overlay + tray + visual notification
@@ -191,6 +191,8 @@ class SignTypeApp:
         the 300ms consistent classification gating.
         """
         letter, confidence = self.fingerspell.predict(landmarks)
+        if confidence > 0.5:
+            print(f"  [Detected] {letter} ({confidence:.0%})", end="\r")
         self.text_injector.process_classification(letter, confidence, self._conf_threshold)
         self.overlay.update_buffer(self.text_injector.buffer_text)
 
@@ -261,6 +263,10 @@ class SignTypeApp:
         config_thread.start()
 
         self.visual_feedback.announce_ready()
+
+        # Start in TYPING mode directly (dynamic gesture model for mode
+        # switching may not be trained yet)
+        self.state_machine.wake()
 
         print("[SignType] All systems running.")
         print(f"[SignType] Settings: http://127.0.0.1:{port}")

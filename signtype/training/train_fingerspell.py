@@ -60,7 +60,7 @@ def train_fingerspell(
         y_all.extend([class_name] * len(data))
         print(f"  Loaded {class_name}: {len(data)} samples")
 
-    X = np.vstack(X_all)
+    X = np.vstack(X_all).astype(np.float64)
     y = np.array(y_all)
 
     print(f"\nTotal samples: {len(X)}")
@@ -79,10 +79,10 @@ def train_fingerspell(
         hidden_layer_sizes=(256, 128),
         activation="relu",
         solver="adam",
-        max_iter=500,
+        max_iter=300,
         random_state=42,
-        early_stopping=True,
-        validation_fraction=0.1,
+        early_stopping=False,
+        tol=1e-4,
         verbose=True,
     )
     clf.fit(X_train, y_train)
