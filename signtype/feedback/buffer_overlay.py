@@ -1,13 +1,20 @@
 """Floating text buffer overlay — GTK4 + gtk4-layer-shell for Wayland.
 
-Displays the current typing buffer above other windows using the
-Wayland layer-shell protocol. Falls back to a basic GTK4 window
-if layer-shell is not available.
+Displays:
+- Current mode (TYPING / COMMAND / IDLE) — always visible
+- Live confidence bar showing detection strength
+- Detected letter in large font, green flash on confirm
+- Typing buffer (last 20 characters)
+- Toast notifications
+
+Dark glassmorphism theme with semi-transparent background.
+Falls back to a basic GTK4 window if layer-shell is not available.
 """
 
 import os
 import threading
 import sys
+import time
 
 # Must be set before importing Gtk
 os.environ.setdefault("GDK_BACKEND", "wayland")
@@ -17,7 +24,6 @@ try:
     gi.require_version("Gtk", "4.0")
     from gi.repository import Gtk, Gdk, GLib, Pango
 
-    # Try to load gtk4-layer-shell
     try:
         gi.require_version("Gtk4LayerShell", "1.0")
         from gi.repository import Gtk4LayerShell
@@ -32,18 +38,18 @@ except ImportError:
     HAS_LAYER_SHELL = False
 
 
+# ── Mode colors ────────────────────────────────────────────────────
+
+MODE_CONFIG = {
+    "TYPING":    {"color": "#2ecc71", "label": "✋ TYPING",    "border": "#2ecc71"},
+    "COMMAND":   {"color": "#e67e22", "label": "👆 COMMAND",   "border": "#e67e22"},
+    "IDLE":      {"color": "#95a5a6", "label": "⏸ IDLE",      "border": "#555"},
+    "RECORDING": {"color": "#e74c3c", "label": "⏺ RECORDING", "border": "#e74c3c"},
+}
+
+
 class BufferOverlay:
-    """Frameless floating buffer window using GTK4.
-
-    Shows buffer text, mode indicator (TYPING=green border, COMMAND=orange).
-    Uses gtk4-layer-shell to sit in the overlay layer on Wayland.
-    """
-
-    # Mode colors
-    TYPING_COLOR = "#2ecc71"   # Green
-    COMMAND_COLOR = "#e67e22"  # Orange
-    IDLE_COLOR = "#95a5a6"     # Gray
-    RECORDING_COLOR = "#e74c3c"  # Red
+    """Frameless floating overlay with live confidence feedback."""
 
     def __init__(self):
         if not HAS_GTK:
@@ -54,20 +60,26 @@ class BufferOverlay:
 
         self._app = None
         self._window = None
-        self._label = None
+        self._buffer_label = None
         self._mode_label = None
+        self._detected_label = None
+        self._confidence_bar = None
         self._notification_label = None
         self._thread = None
+
         self._buffer_text = ""
-        self._mode = "idle"
+        self._mode = "TYPING"
+        self._confidence = 0.0
+        self._detected_letter = ""
+        self._notification_timeout_id = None
 
     def start(self):
         """Start the overlay in a separate thread."""
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
+        time.sleep(0.3)  # Let GTK initialize
 
     def _run(self):
-        """Run the GTK4 application."""
         self._app = Gtk.Application(application_id="com.signtype.overlay")
         self._app.connect("activate", self._on_activate)
         self._app.run(None)
@@ -75,225 +87,309 @@ class BufferOverlay:
     def _on_activate(self, app):
         """Build the overlay window."""
         self._window = Gtk.ApplicationWindow(application=app)
-        self._window.set_title("SignType Buffer")
-        self._window.set_default_size(400, 60)
+        self._window.set_title("SignType")
+        self._window.set_default_size(380, 140)
 
-        # Layer shell setup (Wayland overlay)
+        # Layer shell setup
         if HAS_LAYER_SHELL:
             Gtk4LayerShell.init_for_window(self._window)
             Gtk4LayerShell.set_layer(self._window, Gtk4LayerShell.Layer.OVERLAY)
             Gtk4LayerShell.set_anchor(self._window, Gtk4LayerShell.Edge.BOTTOM, True)
-            Gtk4LayerShell.set_margin(self._window, Gtk4LayerShell.Edge.BOTTOM, 80)
+            Gtk4LayerShell.set_anchor(self._window, Gtk4LayerShell.Edge.RIGHT, True)
+            Gtk4LayerShell.set_margin(self._window, Gtk4LayerShell.Edge.BOTTOM, 40)
+            Gtk4LayerShell.set_margin(self._window, Gtk4LayerShell.Edge.RIGHT, 40)
             Gtk4LayerShell.set_keyboard_mode(
                 self._window, Gtk4LayerShell.KeyboardMode.NONE
             )
         else:
-            # Fallback: basic window hints
             self._window.set_decorated(False)
 
-        # Make the window transparent
         self._apply_css()
 
-        # Layout
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        box.set_halign(Gtk.Align.CENTER)
-        box.set_valign(Gtk.Align.CENTER)
-        box.set_margin_start(16)
-        box.set_margin_end(16)
-        box.set_margin_top(8)
-        box.set_margin_bottom(8)
+        # ── Main layout ──
+        main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        main_box.add_css_class("main-container")
 
-        # Mode indicator
+        # Row 1: Mode indicator (always visible)
         self._mode_label = Gtk.Label()
-        self._mode_label.set_markup(self._mode_markup("IDLE"))
         self._mode_label.add_css_class("mode-label")
-        box.append(self._mode_label)
+        self._mode_label.set_halign(Gtk.Align.START)
+        self._update_mode_label("TYPING")
+        main_box.append(self._mode_label)
 
-        # Buffer text
-        self._label = Gtk.Label()
-        self._label.set_markup('<span font="24" foreground="white">_</span>')
-        self._label.set_wrap(True)
-        self._label.set_max_width_chars(40)
-        self._label.add_css_class("buffer-label")
-        box.append(self._label)
+        # Row 2: Detected letter + confidence bar
+        detect_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        detect_box.set_margin_top(6)
+        detect_box.set_margin_bottom(6)
 
-        # Notification label (toast messages)
+        self._detected_label = Gtk.Label(label="—")
+        self._detected_label.add_css_class("detected-letter")
+        detect_box.append(self._detected_label)
+
+        # Confidence bar (vertical progress bar)
+        conf_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        conf_box.set_valign(Gtk.Align.CENTER)
+        conf_box.set_hexpand(True)
+
+        self._conf_percent_label = Gtk.Label(label="0%")
+        self._conf_percent_label.add_css_class("conf-percent")
+        self._conf_percent_label.set_halign(Gtk.Align.END)
+        conf_box.append(self._conf_percent_label)
+
+        self._confidence_bar = Gtk.ProgressBar()
+        self._confidence_bar.set_fraction(0.0)
+        self._confidence_bar.add_css_class("confidence-bar")
+        self._confidence_bar.set_hexpand(True)
+        conf_box.append(self._confidence_bar)
+
+        detect_box.append(conf_box)
+        main_box.append(detect_box)
+
+        # Row 3: Typing buffer
+        self._buffer_label = Gtk.Label(label="_")
+        self._buffer_label.add_css_class("buffer-label")
+        self._buffer_label.set_wrap(True)
+        self._buffer_label.set_max_width_chars(35)
+        self._buffer_label.set_halign(Gtk.Align.START)
+        main_box.append(self._buffer_label)
+
+        # Row 4: Toast notification (hidden by default)
         self._notification_label = Gtk.Label()
-        self._notification_label.set_markup("")
         self._notification_label.add_css_class("notification-label")
         self._notification_label.set_visible(False)
         self._notification_label.set_wrap(True)
-        self._notification_label.set_max_width_chars(50)
-        box.append(self._notification_label)
+        self._notification_label.set_max_width_chars(40)
+        main_box.append(self._notification_label)
 
-        # Container with border
-        frame = Gtk.Frame()
-        frame.set_child(box)
-        frame.add_css_class("overlay-frame")
-
-        self._window.set_child(frame)
+        self._window.set_child(main_box)
         self._window.present()
 
     def _apply_css(self):
-        """Apply custom CSS for the overlay appearance."""
-        css = """
-        window {
-            background-color: rgba(30, 30, 30, 0.85);
-            border-radius: 12px;
-        }
-        .overlay-frame {
-            border: 3px solid #95a5a6;
-            border-radius: 12px;
-            background-color: rgba(30, 30, 30, 0.85);
-            padding: 8px;
-        }
-        .overlay-frame.typing {
-            border-color: #2ecc71;
-        }
-        .overlay-frame.command {
-            border-color: #e67e22;
-        }
-        .overlay-frame.recording {
-            border-color: #e74c3c;
-        }
-        .mode-label {
-            font-size: 10px;
-        }
-        .buffer-label {
-            font-size: 24px;
-            color: white;
-        }
-        .notification-label {
-            font-size: 12px;
-            color: #ecf0f1;
-            padding: 4px 8px;
-            margin-top: 4px;
-        }
-        .notification-label.error {
-            color: #e74c3c;
-        }
-        .notification-label.success {
-            color: #2ecc71;
-        }
-        .notification-label.warning {
-            color: #f39c12;
-        }
-        """
-        provider = Gtk.CssProvider()
-        provider.load_from_string(css)
+        """Apply glassmorphism dark theme."""
+        css = Gtk.CssProvider()
+        css.load_from_string("""
+            .main-container {
+                background: rgba(15, 15, 25, 0.88);
+                border-radius: 16px;
+                border: 1px solid rgba(255, 255, 255, 0.08);
+                padding: 14px 18px;
+            }
+
+            .mode-label {
+                font-size: 11px;
+                font-weight: 700;
+                letter-spacing: 2px;
+                padding: 3px 10px;
+                border-radius: 4px;
+            }
+
+            .detected-letter {
+                font-size: 42px;
+                font-weight: 800;
+                color: #fff;
+                min-width: 56px;
+                font-family: monospace;
+            }
+
+            .conf-percent {
+                font-size: 10px;
+                color: rgba(255, 255, 255, 0.5);
+            }
+
+            .confidence-bar {
+                min-height: 6px;
+                border-radius: 3px;
+            }
+            .confidence-bar trough {
+                background: rgba(255, 255, 255, 0.08);
+                border-radius: 3px;
+                min-height: 6px;
+            }
+            .confidence-bar progress {
+                background: #2ecc71;
+                border-radius: 3px;
+                min-height: 6px;
+            }
+
+            .confidence-bar.low progress { background: #e74c3c; }
+            .confidence-bar.medium progress { background: #f39c12; }
+            .confidence-bar.high progress { background: #2ecc71; }
+
+            .buffer-label {
+                font-size: 18px;
+                font-family: monospace;
+                color: rgba(255, 255, 255, 0.9);
+                margin-top: 4px;
+                padding: 4px 0;
+                border-top: 1px solid rgba(255, 255, 255, 0.06);
+            }
+
+            .notification-label {
+                font-size: 12px;
+                color: #2ecc71;
+                margin-top: 6px;
+                padding: 4px 8px;
+                border-radius: 6px;
+                background: rgba(46, 204, 113, 0.1);
+            }
+            .notification-label.error {
+                color: #e74c3c;
+                background: rgba(231, 76, 60, 0.1);
+            }
+            .notification-label.warning {
+                color: #f39c12;
+                background: rgba(243, 156, 18, 0.1);
+            }
+        """)
         Gtk.StyleContext.add_provider_for_display(
             Gdk.Display.get_default(),
-            provider,
+            css,
             Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
         )
 
-    def _mode_markup(self, mode_text: str) -> str:
-        colors = {
-            "IDLE": self.IDLE_COLOR,
-            "TYPING": self.TYPING_COLOR,
-            "COMMAND": self.COMMAND_COLOR,
-            "RECORDING": self.RECORDING_COLOR,
-        }
-        color = colors.get(mode_text.upper(), self.IDLE_COLOR)
-        return f'<span font="10" foreground="{color}" weight="bold">{mode_text.upper()}</span>'
+    def _update_mode_label(self, mode: str):
+        """Update the always-visible mode indicator."""
+        cfg = MODE_CONFIG.get(mode.upper(), MODE_CONFIG["IDLE"])
+        if self._mode_label:
+            self._mode_label.set_markup(
+                f'<span foreground="{cfg["color"]}" font="11">'
+                f'{cfg["label"]}</span>'
+            )
+
+    # ── Public update methods (thread-safe via GLib.idle_add) ──
 
     def update_buffer(self, text: str):
-        """Thread-safe buffer text update."""
+        """Update the typing buffer display."""
         self._buffer_text = text
-        if self._label is not None:
-            GLib.idle_add(self._do_update_buffer, text)
+        GLib.idle_add(self._do_update_buffer)
 
-    def _do_update_buffer(self, text: str):
-        display_text = text if text else "_"
-        escaped = GLib.markup_escape_text(display_text)
-        self._label.set_markup(f'<span font="24" foreground="white">{escaped}</span>')
-        return False
+    def _do_update_buffer(self):
+        if self._buffer_label:
+            display = self._buffer_text if self._buffer_text else "_"
+            self._buffer_label.set_markup(
+                f'<span font="18" foreground="rgba(255,255,255,0.9)">'
+                f'{GLib.markup_escape_text(display)}</span>'
+            )
+
+    def update_confidence(self, confidence: float, letter: str):
+        """Update the confidence bar and detected letter."""
+        self._confidence = confidence
+        self._detected_letter = letter
+        GLib.idle_add(self._do_update_confidence)
+
+    def _do_update_confidence(self):
+        if self._confidence_bar:
+            self._confidence_bar.set_fraction(min(self._confidence, 1.0))
+
+            # Color the bar based on confidence level
+            bar = self._confidence_bar
+            bar.remove_css_class("low")
+            bar.remove_css_class("medium")
+            bar.remove_css_class("high")
+            if self._confidence < 0.5:
+                bar.add_css_class("low")
+            elif self._confidence < 0.8:
+                bar.add_css_class("medium")
+            else:
+                bar.add_css_class("high")
+
+        if self._conf_percent_label:
+            self._conf_percent_label.set_text(f"{self._confidence:.0%}")
+
+        if self._detected_label:
+            if self._detected_letter:
+                color = "#2ecc71" if self._confidence >= 0.8 else "#fff"
+                self._detected_label.set_markup(
+                    f'<span font="42" foreground="{color}" weight="heavy">'
+                    f'{GLib.markup_escape_text(self._detected_letter.upper())}</span>'
+                )
+            else:
+                self._detected_label.set_markup(
+                    '<span font="42" foreground="rgba(255,255,255,0.2)">—</span>'
+                )
 
     def update_mode(self, mode: str):
-        """Thread-safe mode update. Changes border color and mode label."""
-        self._mode = mode
-        if self._mode_label is not None:
-            GLib.idle_add(self._do_update_mode, mode)
+        """Update the always-visible mode indicator."""
+        self._mode = mode.upper()
+        GLib.idle_add(self._do_update_mode)
 
-    def _do_update_mode(self, mode: str):
-        self._mode_label.set_markup(self._mode_markup(mode))
+    def _do_update_mode(self):
+        self._update_mode_label(self._mode)
 
-        # Update frame CSS class
-        if self._window:
-            frame = self._window.get_child()
-            if frame:
-                for cls in ("typing", "command", "recording"):
-                    frame.remove_css_class(cls)
-                if mode.lower() in ("typing", "command", "recording"):
-                    frame.add_css_class(mode.lower())
-        return False
+    def show_notification(self, message: str, level: str = "info",
+                          duration_ms: int = 3000):
+        """Show a toast notification."""
+        GLib.idle_add(self._do_show_notification, message, level, duration_ms)
 
-    def show_notification(self, message: str, level: str = "info", duration_ms: int = 3000):
-        """Show a visual toast notification on the overlay."""
-        if self._notification_label is not None:
-            GLib.idle_add(self._do_show_notification, message, level, duration_ms)
+    def _do_show_notification(self, message, level, duration_ms):
+        if not self._notification_label:
+            return
 
-    def _do_show_notification(self, message: str, level: str, duration_ms: int):
-        escaped = GLib.markup_escape_text(message)
-        color = {"error": "#e74c3c", "success": "#2ecc71", "warning": "#f39c12"}.get(
-            level, "#ecf0f1"
-        )
+        self._notification_label.remove_css_class("error")
+        self._notification_label.remove_css_class("warning")
+        if level == "error":
+            self._notification_label.add_css_class("error")
+        elif level == "warning":
+            self._notification_label.add_css_class("warning")
+
         self._notification_label.set_markup(
-            f'<span font="12" foreground="{color}">{escaped}</span>'
+            f'<span font="12">{GLib.markup_escape_text(message)}</span>'
         )
         self._notification_label.set_visible(True)
-        # Auto-hide after duration
-        GLib.timeout_add(duration_ms, self._do_hide_notification)
-        return False
 
-    def _do_hide_notification(self):
+        if self._notification_timeout_id:
+            GLib.source_remove(self._notification_timeout_id)
+        self._notification_timeout_id = GLib.timeout_add(
+            duration_ms, self._hide_notification
+        )
+
+    def _hide_notification(self):
         if self._notification_label:
             self._notification_label.set_visible(False)
-        return False  # Don't repeat
-
-    def hide(self):
-        """Hide the overlay."""
-        if self._window:
-            GLib.idle_add(self._window.hide)
+        self._notification_timeout_id = None
+        return False
 
     def show(self):
-        """Show the overlay."""
+        GLib.idle_add(self._do_show)
+
+    def _do_show(self):
         if self._window:
-            GLib.idle_add(self._window.present)
+            self._window.present()
+
+    def hide(self):
+        GLib.idle_add(self._do_hide)
+
+    def _do_hide(self):
+        if self._window:
+            self._window.set_visible(False)
 
     def quit(self):
-        """Quit the GTK application."""
+        GLib.idle_add(self._do_quit)
+
+    def _do_quit(self):
         if self._app:
-            GLib.idle_add(self._app.quit)
+            self._app.quit()
 
 
 # Quick self-test
 if __name__ == "__main__":
-    if not HAS_GTK:
-        print("✗ GTK4 not available")
-        sys.exit(1)
-
-    print(f"GTK4 available: {HAS_GTK}")
-    print(f"Layer shell available: {HAS_LAYER_SHELL}")
-
+    print(f"GTK4: {HAS_GTK}, Layer Shell: {HAS_LAYER_SHELL}")
     overlay = BufferOverlay()
+    overlay.start()
 
-    def test_updates():
-        import time
-        time.sleep(2)
-        overlay.update_mode("TYPING")
-        overlay.update_buffer("hello")
-        time.sleep(2)
-        overlay.update_mode("COMMAND")
-        overlay.update_buffer("cmd mode")
-        time.sleep(2)
-        overlay.quit()
+    import time
+    time.sleep(1)
 
-    t = threading.Thread(target=test_updates, daemon=True)
-    t.start()
+    overlay.update_mode("TYPING")
+    for i in range(20):
+        conf = (i + 1) / 20
+        letter = chr(65 + i % 26)
+        overlay.update_confidence(conf, letter)
+        time.sleep(0.3)
 
-    # Must run GTK on main thread for self-test
-    overlay._app = Gtk.Application(application_id="com.signtype.overlay.test")
-    overlay._app.connect("activate", overlay._on_activate)
-    overlay._app.run(None)
-    print("✓ Buffer overlay test complete")
+    overlay.update_buffer("hello world")
+    overlay.show_notification("Test notification!", "success", 2000)
+    time.sleep(3)
+
+    overlay.quit()
+    print("✓ Overlay test complete")

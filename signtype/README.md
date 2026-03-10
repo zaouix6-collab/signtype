@@ -1,109 +1,143 @@
-# SignType
+# 🤟 SignType
 
-An open-source background application that brings deaf and hard-of-hearing users closer to their first language — sign language — by enabling typing in any application using ASL finger spelling via webcam, and executing system shortcuts bound to custom gestures. No keyboard required.
+**Type with sign language.** SignType uses your webcam to recognize ASL finger spelling and types letters directly into any focused application — browser, chat, terminal, anywhere.
 
-**All feedback is visual.** This system is built for deaf users — there is no audio output of any kind.
+Built for **deaf and hard-of-hearing users**. All feedback is visual. No audio.
 
-## License
-
-MIT License — see [LICENSE](LICENSE).
-
-## Platform
-
-- **Primary target**: Linux (Arch Linux, KDE Plasma)
-- **Display server**: Wayland (tested on KDE Plasma). X11 support is partial.
-- **All processing is local and offline.** No cloud APIs, no telemetry.
-
-## Requirements
-
-### System Dependencies (Arch Linux)
+## Quick Start
 
 ```bash
-# Python 3.12 (required for MediaPipe — does NOT support 3.13+)
-yay -S python312
+# 1. Install system dependencies (Arch Linux)
+sudo pacman -S python python-gobject gtk4 gtk4-layer-shell ydotool
 
-# Wayland tools, GTK4 overlay, and system tray support
-sudo pacman -S wtype ydotool gtk4-layer-shell python-gobject gtk4 gobject-introspection
-```
+# 2. Set up ydotool
+systemctl --user enable --now ydotool
+sudo usermod -aG input $USER
+# Log out and back in after this step
 
-> **Note on ydotool**: After installing, enable the daemon and add yourself to the `input` group:
-> ```bash
-> sudo systemctl enable --now ydotool
-> sudo usermod -aG input $USER
-> # Then log out and back in
-> ```
-
-### Python Setup
-
-```bash
+# 3. Install Python dependencies
 cd signtype
-python3.12 -m venv .venv --system-site-packages
+python -m venv .venv
 source .venv/bin/activate
-pip install torch --index-url https://download.pytorch.org/whl/cpu
 pip install -r requirements.txt
-```
 
-### ASL Alphabet Dataset
+# 4. Train the model (first time only)
+python training/preprocess_dataset.py    # Extract landmarks
+python training/train_fingerspell.py     # Train classifier
 
-The finger spelling model trains on the [ASL Alphabet dataset](https://www.kaggle.com/datasets/grassknoted/asl-alphabet) from Kaggle (87,000 images, 29 classes).
-
-Download via Kaggle CLI:
-```bash
-KAGGLE_API_TOKEN=your_token kaggle datasets download grassknoted/asl-alphabet \
-  -p data/asl_alphabet_raw --unzip
-```
-
-Or download manually and extract into `data/asl_alphabet_raw/`.
-
-### Train Models
-
-```bash
-source .venv/bin/activate
-python training/preprocess_dataset.py   # Extract landmarks from images
-python training/train_fingerspell.py    # Train MLP (target: ≥97% accuracy)
-```
-
-## Usage
-
-```bash
-source .venv/bin/activate
+# 5. Run
 python main.py
 ```
 
-On first launch, the system detects missing models and guides you through setup.
+## How It Works
 
-## Modes
+1. **Camera** captures your hand via webcam
+2. **MediaPipe** extracts 21 hand landmarks per frame
+3. **ML Classifier** identifies which ASL letter you're signing
+4. **Hold to confirm** — hold a sign steady for 400ms to type it
+5. **ydotool** injects the keystroke into whatever app is focused
 
-- **Typing Mode**: Sign ASL letters → characters appear in floating buffer → confirm gesture injects text into active app
-- **Command Mode**: Perform bound gestures → system shortcuts fire after confidence hold
-- **Mode Switch**: Both open palms facing camera toggles between modes
-- **Visual notifications**: All status changes, errors, and confirmations appear as toast messages on the overlay
+The system shows a floating overlay with:
+- **Mode indicator** — always shows TYPING / COMMAND / IDLE
+- **Confidence bar** — red → yellow → green as certainty increases
+- **Detected letter** — large display of what the model sees
+- **Typed buffer** — last 20 characters you've typed
+
+## Supported Letters
+
+The fingerspell model recognizes the **ASL alphabet** (A-Z), plus:
+- **Space** — sign "SPACE"
+- **Delete** — sign "DEL" to backspace
+- **Nothing** — rest position (no typing)
+
+> **Note:** J and Z require motion and are recognized through the dynamic gesture model (train separately with `python training/train_dynamic.py`).
 
 ## Settings
 
-Open `http://localhost:7842` from the system tray menu to configure gesture bindings, confidence thresholds, and system settings.
+Open **http://127.0.0.1:7842** while the app is running:
 
-## Architecture
+- **Camera preview** — see what the model sees (MJPEG stream)
+- **Confidence threshold** — minimum certainty to accept a letter (default: 70%)
+- **Hold time** — how long to hold a sign before typing (default: 400ms)
+- **Cooldown** — delay before allowing the same letter again (default: 600ms)
+- **Test Typing** — sends "hello" to verify ydotool works
+
+Settings are saved to `config.json` and hot-reloaded automatically.
+
+## Troubleshooting
+
+### Overlay doesn't float on top
+The overlay uses `gtk4-layer-shell`. If it appears as a normal window:
+```bash
+# Verify the library is installed
+find /usr -name "libgtk4-layer-shell*"
+# Should show: /usr/lib/libgtk4-layer-shell.so
+```
+The app sets `LD_PRELOAD` automatically. If the overlay still doesn't float, check that `gtk4-layer-shell` is installed and the path matches.
+
+### Overlay background isn't transparent / blurred
+On **KDE Plasma Wayland**, the blur effect requires:
+1. Go to **System Settings → Workspace Behavior → Desktop Effects**
+2. Enable the **Blur** effect
+
+Without blur enabled, the overlay renders as a solid dark rectangle (still functional, just not as pretty).
+
+### Letters won't type into apps
+```bash
+# Check ydotool is running
+systemctl --user status ydotool
+
+# If not started:
+systemctl --user enable --now ydotool
+
+# Make sure you're in the input group
+groups  # Should include "input"
+
+# If not:
+sudo usermod -aG input $USER
+# Then log out and back in
+```
+
+### "wtype: Compositor does not support virtual keyboard"
+This is expected on KDE Wayland. SignType automatically falls back to `ydotool` which works everywhere.
+
+### Camera not detected
+```bash
+# List cameras
+ls /dev/video*
+
+# Try a different camera index in settings (http://127.0.0.1:7842)
+# or change camera_index in config.json
+```
+
+## Project Structure
 
 ```
 signtype/
-├── core/           # Camera, MediaPipe, classifiers, state machine, I/O
-├── feedback/       # GTK4 overlay, visual notifications, system tray
-├── training/       # Dataset preprocessing, MLP/LSTM training, gesture recorder
-├── settings/       # FastAPI web UI for configuration
-├── main.py         # 7-thread orchestration entry point
-└── config.json     # Runtime configuration
+├── main.py                    # Entry point — orchestrates everything
+├── core/
+│   ├── camera.py              # Threaded camera capture
+│   ├── landmark_extractor.py  # MediaPipe hand landmarks
+│   ├── fingerspell_classifier.py  # ASL letter recognition (MLP)
+│   ├── text_injector.py       # Types into focused apps (ydotool)
+│   ├── state_machine.py       # IDLE ↔ TYPING ↔ COMMAND modes
+│   ├── gesture_classifier.py  # Static gesture recognition
+│   ├── dynamic_classifier.py  # Dynamic gesture recognition (LSTM)
+│   └── command_dispatcher.py  # Execute bound commands
+├── feedback/
+│   ├── buffer_overlay.py      # GTK4 floating overlay
+│   ├── audio.py               # Visual notifications (no audio)
+│   └── tray.py                # System tray icon
+├── settings/
+│   └── server.py              # Web settings UI (FastAPI)
+├── training/
+│   ├── preprocess_dataset.py  # Extract landmarks from dataset
+│   ├── train_fingerspell.py   # Train ASL classifier
+│   └── train_dynamic.py       # Train dynamic gestures
+├── config.json                # User configuration
+└── requirements.txt           # Python dependencies
 ```
 
-Built for community retraining — swap the dataset and retrain for BSL, ArSL, or any other sign language with no code changes.
+## License
 
-## Contributing
-
-1. Replace images in `data/asl_alphabet_raw/` with your sign language dataset
-2. Run `python training/preprocess_dataset.py` to extract landmarks
-3. Run `python training/train_fingerspell.py` to train the classifier
-4. The rest of the codebase works unchanged — all language-specific logic lives in the training data
-
-## Permissions Note
-
-Input injection uses `wtype` (text) and `ydotool` (hotkeys) which work without root on Wayland after `input` group setup. The optional X11 fallback (`pyautogui`) may need additional configuration.
+MIT
