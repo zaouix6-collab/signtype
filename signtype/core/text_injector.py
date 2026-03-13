@@ -1,23 +1,33 @@
 """Text injector — types directly into the focused application.
 
-Uses wtype on Wayland, ydotool as fallback, pyautogui for X11.
-Each confirmed letter is immediately typed into whatever app/textbox
-the user has focused — works everywhere (browser, terminal, chat, etc).
+UX model: Sign → Hold → Confirm → Release → Next Sign
+
+State machine per letter:
+  IDLE        → no sign detected, waiting
+  DETECTING   → consistent sign detected, accumulating hold time
+  CONFIRMED   → letter typed! waiting for hand to CHANGE before accepting again
+  
+Key design decisions:
+  - A letter types ONCE when held for hold_ms
+  - After typing, the sign must CHANGE (different letter or rest) before
+    the same letter can be typed again
+  - This prevents repeats naturally without fragile cooldown timers
+  - To type double letters (e.g. "ll"), sign L → release/rest → sign L again
+  - "nothing" / low confidence resets state (hand went to rest)
 """
 
 import os
 import subprocess
 import threading
 import time
+from typing import Callable
 
 
 def _detect_session_type() -> str:
-    """Detect whether we're on Wayland or X11."""
     return os.environ.get("XDG_SESSION_TYPE", "x11")
 
 
 def _has_command(name: str) -> bool:
-    """Check if a command exists on PATH."""
     try:
         subprocess.run(["which", name], capture_output=True, check=True)
         return True
@@ -25,21 +35,27 @@ def _has_command(name: str) -> bool:
         return False
 
 
-class TextInjector:
-    """Types letters directly into the focused application.
+# States for the typing state machine
+IDLE = "idle"
+DETECTING = "detecting"
+CONFIRMED = "confirmed"
 
-    Implements 300ms consistent classification gating — a character is
-    only typed after it's consistently classified for the hold duration.
-    After typing, there's a cooldown to prevent repeats.
+
+class TextInjector:
+    """Types ASL letters into the focused application.
+
+    Uses a sign-release-sign model: each sign produces exactly ONE
+    keystroke, and the hand must move away before the same letter
+    can be typed again.
     """
 
-    def __init__(self, fingerspell_hold_ms: int = 400, cooldown_ms: int = 600):
+    def __init__(self, fingerspell_hold_ms: int = 400, cooldown_ms: int = 300):
         self._lock = threading.Lock()
         self._hold_ms = fingerspell_hold_ms
-        self._cooldown_ms = cooldown_ms
+        self._cooldown_ms = cooldown_ms  # minimum gap between ANY two keystrokes
         self._session_type = _detect_session_type()
 
-        # Detect available typing tools (ydotool preferred on KDE Wayland)
+        # Typing backend
         self._use_ydotool = _has_command("ydotool")
         self._use_wtype = (not self._use_ydotool and
                            self._session_type == "wayland" and
@@ -53,90 +69,140 @@ class TextInjector:
             print("[TextInjector] WARNING: No typing tool found!")
             print("  Install ydotool: sudo pacman -S ydotool")
 
-        # Confidence gating state
-        self._current_candidate: str | None = None
-        self._candidate_start_time: float | None = None
-        self._last_typed_time: float = 0.0
-        self._last_typed_char: str | None = None
+        # --- State machine ---
+        self._state: str = IDLE
+        self._current_char: str | None = None      # char being tracked
+        self._hold_start: float | None = None       # when tracking started
+        self._confirmed_char: str | None = None     # last typed char (waiting for release)
+        self._last_type_time: float = 0.0           # when last keystroke was sent
+        self._hold_progress: float = 0.0            # 0.0 to 1.0 for overlay
 
         # Visual buffer for overlay display
-        self._buffer = []
+        self._buffer: list[str] = []
 
         # Callbacks
-        self.on_buffer_change: object | None = None
-        self.on_inject: object | None = None
+        self.on_buffer_change: Callable[[str], None] | None = None
+        self.on_inject: Callable[[str], None] | None = None
+        self.on_hold_progress: Callable[[float, str], None] | None = None
 
     @property
     def buffer_text(self) -> str:
-        """Current visual buffer (last 20 chars for overlay display)."""
         with self._lock:
             return "".join(self._buffer[-20:])
 
-    def process_classification(self, letter: str, confidence: float,
-                                min_confidence: float = 0.85):
-        """Process a classification result with confidence gating.
+    @property
+    def hold_progress(self) -> float:
+        return self._hold_progress
 
-        A character is typed into the focused app only after being
-        consistently classified for fingerspell_hold_ms milliseconds.
+    def process_classification(self, letter: str, confidence: float,
+                                min_confidence: float = 0.70):
+        """Process one frame's classification result.
+
+        This implements the Sign → Hold → Confirm → Release cycle.
         """
         now = time.time()
 
-        # Handle special gestures
+        # --- Special: delete gesture ---
         if letter == "del":
-            if (now - self._last_typed_time) * 1000 >= self._cooldown_ms:
+            if now - self._last_type_time > self._cooldown_ms / 1000:
                 self._type_backspace()
-                self._last_typed_time = now
-            self._reset_candidate()
+                self._last_type_time = now
+            self._go_idle()
             return
 
-        # Skip low confidence or "nothing" class
-        if letter in ("nothing", "NOTHING") or confidence < min_confidence:
-            self._reset_candidate()
+        # --- Rest position / low confidence → reset ---
+        if letter in ("nothing", "NOTHING", "") or confidence < min_confidence:
+            # Hand went to rest or model is uncertain.
+            # This is the "release" that allows the same letter again.
+            if self._state == CONFIRMED:
+                # Great — user released after typing. Ready for next letter.
+                pass
+            self._go_idle()
             return
 
-        # Convert label to character
+        # --- Convert label to char ---
         if letter in ("space", "SPACE"):
             char = " "
         elif len(letter) == 1 and letter.isalpha():
             char = letter.lower()
         else:
-            self._reset_candidate()
+            self._go_idle()
             return
 
-        # Cooldown check — don't repeat same char too fast
-        if (char == self._last_typed_char and
-                (now - self._last_typed_time) * 1000 < self._cooldown_ms):
-            return
+        # --- State machine ---
 
-        # Hold-to-confirm logic
-        if self._current_candidate == char:
-            elapsed_ms = (now - self._candidate_start_time) * 1000
-            if elapsed_ms >= self._hold_ms:
-                # Confirmed! Type it directly into focused app
-                self._type_char(char)
-                self._last_typed_char = char
-                self._last_typed_time = now
+        if self._state == IDLE:
+            # New sign detected — start tracking
+            self._state = DETECTING
+            self._current_char = char
+            self._hold_start = now
+            self._hold_progress = 0.0
+            self._notify_progress(0.0, char)
 
-                # Update visual buffer
-                with self._lock:
-                    self._buffer.append(char)
-                if self.on_buffer_change:
-                    self.on_buffer_change(self.buffer_text)
-                if self.on_inject:
-                    self.on_inject(char)
+        elif self._state == DETECTING:
+            if char == self._current_char:
+                # Same letter — accumulate hold time
+                elapsed_ms = (now - self._hold_start) * 1000
+                self._hold_progress = min(elapsed_ms / self._hold_ms, 1.0)
+                self._notify_progress(self._hold_progress, char)
 
-                self._reset_candidate()
-        else:
-            # New character — start tracking
-            self._current_candidate = char
-            self._candidate_start_time = now
+                if elapsed_ms >= self._hold_ms:
+                    # CONFIRMED! Type the letter.
+                    # But enforce a minimum gap between keystrokes.
+                    if now - self._last_type_time > self._cooldown_ms / 1000:
+                        self._type_char(char)
+                        self._last_type_time = now
 
-    def _reset_candidate(self):
-        self._current_candidate = None
-        self._candidate_start_time = None
+                        with self._lock:
+                            self._buffer.append(char)
+                        if self.on_buffer_change:
+                            self.on_buffer_change(self.buffer_text)
+                        if self.on_inject:
+                            self.on_inject(char)
+
+                    # Move to CONFIRMED — waiting for hand to change
+                    self._state = CONFIRMED
+                    self._confirmed_char = char
+                    self._hold_progress = 1.0
+                    self._notify_progress(1.0, char)
+            else:
+                # Different letter — restart tracking with new letter
+                self._state = DETECTING
+                self._current_char = char
+                self._hold_start = now
+                self._hold_progress = 0.0
+                self._notify_progress(0.0, char)
+
+        elif self._state == CONFIRMED:
+            if char == self._confirmed_char:
+                # Still showing the same sign — ignore.
+                # User must release or change sign first.
+                pass
+            else:
+                # Hand changed to a DIFFERENT letter — start tracking it
+                self._state = DETECTING
+                self._current_char = char
+                self._confirmed_char = None
+                self._hold_start = now
+                self._hold_progress = 0.0
+                self._notify_progress(0.0, char)
+
+    def _go_idle(self):
+        """Reset to idle state."""
+        self._state = IDLE
+        self._current_char = None
+        self._hold_start = None
+        self._confirmed_char = None
+        self._hold_progress = 0.0
+
+    def _notify_progress(self, progress: float, char: str):
+        """Notify overlay of hold progress."""
+        if self.on_hold_progress:
+            self.on_hold_progress(progress, char)
+
+    # --- Typing backends ---
 
     def _type_char(self, char: str):
-        """Type a single character into the focused application."""
         if self._use_ydotool:
             self._type_ydotool(char)
         elif self._use_wtype:
@@ -145,82 +211,59 @@ class TextInjector:
             print(f"  [WOULD TYPE] {char}")
 
     def _type_wtype(self, char: str):
-        """Type using wtype (Wayland native)."""
         try:
-            subprocess.run(
-                ["wtype", char],
-                check=True,
-                timeout=2.0,
-                capture_output=True,
-            )
+            subprocess.run(["wtype", char], check=True, timeout=2.0,
+                          capture_output=True)
         except FileNotFoundError:
-            print("[TextInjector] wtype not found, falling back to ydotool")
             self._use_wtype = False
             self._use_ydotool = _has_command("ydotool")
             self._type_char(char)
-        except subprocess.CalledProcessError as e:
-            stderr = e.stderr.decode() if e.stderr else ""
-            if stderr:
-                print(f"[TextInjector] wtype error: {stderr.strip()}")
-        except subprocess.TimeoutExpired:
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
             pass
 
     def _type_ydotool(self, char: str):
-        """Type using ydotool (works on both Wayland and X11)."""
         try:
-            subprocess.run(
-                ["ydotool", "type", "--", char],
-                check=True,
-                timeout=2.0,
-                capture_output=True,
-            )
+            subprocess.run(["ydotool", "type", "--", char], check=True,
+                          timeout=2.0, capture_output=True)
         except FileNotFoundError:
-            print("[TextInjector] ydotool not found")
             self._use_ydotool = False
-        except subprocess.CalledProcessError:
-            pass
-        except subprocess.TimeoutExpired:
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
             pass
 
     def _type_backspace(self):
-        """Send a backspace keystroke."""
         with self._lock:
             if self._buffer:
                 self._buffer.pop()
         if self.on_buffer_change:
             self.on_buffer_change(self.buffer_text)
 
-        if self._use_wtype:
+        if self._use_ydotool:
             try:
-                subprocess.run(
-                    ["wtype", "-k", "BackSpace"],
-                    check=True, timeout=2.0, capture_output=True,
-                )
-            except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                subprocess.run(["ydotool", "key", "14:1", "14:0"],
+                              check=True, timeout=2.0, capture_output=True)
+            except (FileNotFoundError, subprocess.CalledProcessError,
+                    subprocess.TimeoutExpired):
                 pass
-        elif self._use_ydotool:
+        elif self._use_wtype:
             try:
-                subprocess.run(
-                    ["ydotool", "key", "14:1", "14:0"],
-                    check=True, timeout=2.0, capture_output=True,
-                )
-            except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                subprocess.run(["wtype", "-k", "BackSpace"],
+                              check=True, timeout=2.0, capture_output=True)
+            except (FileNotFoundError, subprocess.CalledProcessError,
+                    subprocess.TimeoutExpired):
                 pass
 
     def clear(self):
-        """Clear the visual buffer."""
         with self._lock:
             self._buffer.clear()
-        self._reset_candidate()
+        self._go_idle()
         if self.on_buffer_change:
             self.on_buffer_change("")
 
     def delete_last(self):
-        """Delete the last character (for backward compat)."""
         self._type_backspace()
 
     def confirm_and_inject(self):
-        """Legacy: inject entire buffer (no longer primary method)."""
+        """Legacy: inject entire buffer."""
         text = self.buffer_text
         if text:
             for char in text:
@@ -229,20 +272,15 @@ class TextInjector:
             self.clear()
 
 
-# Quick self-test
 if __name__ == "__main__":
-    ti = TextInjector(fingerspell_hold_ms=300)
-    print(f"Session type: {ti._session_type}")
-    print(f"Using wtype: {ti._use_wtype}")
-    print(f"Using ydotool: {ti._use_ydotool}")
+    ti = TextInjector(fingerspell_hold_ms=400)
+    print(f"Session: {ti._session_type}")
+    print(f"ydotool: {ti._use_ydotool}")
     print()
-    print("Test: typing 'hello' into focused app in 3 seconds...")
-    print("Click on a text field NOW!")
+    print("Test: typing 'hello' in 3 seconds...")
+    print("Click a text field NOW!")
     time.sleep(3)
-
     for char in "hello":
         ti._type_char(char)
         time.sleep(0.1)
-
-    print()
-    print("✓ Did 'hello' appear in your text field?")
+    print("✓ Did 'hello' appear?")

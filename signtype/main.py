@@ -143,6 +143,11 @@ class SignTypeApp:
             n.message, n.level, n.duration_ms
         )
 
+        # Hold progress → overlay confidence bar
+        self.text_injector.on_hold_progress = lambda progress, char: (
+            self.overlay.update_confidence(progress, char)
+        )
+
         # Tray callbacks
         self.tray.on_quit = self.stop
         self.tray.on_toggle = self._toggle_system
@@ -246,10 +251,8 @@ class SignTypeApp:
         """Classify landmarks and type confirmed letters."""
         letter, confidence = self.fingerspell.predict(landmarks)
 
-        # Update overlay confidence bar and detected letter
-        self.overlay.update_confidence(confidence, letter if confidence > 0.5 else "")
-
-        # Process through hold-to-confirm gating
+        # Process through sign-release-sign state machine
+        # (hold progress callback updates overlay automatically)
         self.text_injector.process_classification(letter, confidence, self._conf_threshold)
         self.overlay.update_buffer(self.text_injector.buffer_text)
 
